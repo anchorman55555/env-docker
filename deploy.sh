@@ -1,24 +1,43 @@
 #!/usr/bin/env bash
-# =============================================================================
-# Bitrix24 Docker Stack ? Deploy Script
-# Server: crm.cifroweek.com (AlmaLinux 9.8, 64GB RAM, 30-core Xeon 8592+)
-# =============================================================================
+# ==============================================================================
+# Bitrix24 Docker Stack ? Full Deploy Script
+# ==============================================================================
+# ????: Percona MySQL 8.0 | Redis | OpenSearch | PHP 8.2-FPM | nginx
+#        push-server | Postfix | SSL (Let's Encrypt / self-signed)
+#
+# ??:     AlmaLinux 9.x (SELinux Enforcing)
+# ??????: ????????????? 64 GB RAM, 16+ ????
+#
+# ?????????????:
+#   1. git clone <repo_url> /opt/bitrix
+#   2. cd /opt/bitrix
+#   3. ??????????? ? ????????? .env ?????:
+#        for f in *.example; do cp "$f" "${f%.example}"; done
+#        nano .env_sql  # ?????? MYSQL_ROOT_PASSWORD
+#        nano .env_push # ?????? PUSH_SECURITY_KEY
+#   4. bash deploy.sh
+# ==============================================================================
 set -euo pipefail
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
-ok()   { echo -e "${GREEN}[OK]${NC}    $*"; }
-warn() { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-fail() { echo -e "${RED}[FAIL]${NC}  $*"; exit 1; }
-step() { echo -e "\n${BLUE}===> $*${NC}"; }
-info() { echo -e "       $*"; }
+# --- ????? ---
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
+ok()   { echo -e "${GREEN}  [OK]${NC} $*"; }
+warn() { echo -e "${YELLOW}  [!!]${NC} $*"; }
+fail() { echo -e "${RED}  [FAIL]${NC} $*"; exit 1; }
+step() { echo -e "\n${BLUE}??? $* ${NC}"; }
+info() { echo -e "       ${CYAN}$*${NC}"; }
 
-# =============================================================================
-# CONFIG ? change these if deploying to a different server
-# =============================================================================
-SERVER_IP="91.239.143.137"
-DOMAIN="crm.cifroweek.com"
-PROJECT_DIR="/opt/bitrix"
+# ==============================================================================
+# ???????????? ? ???????? ??? ?????? ?? ?????? ??????
+# ==============================================================================
+SERVER_IP="${SERVER_IP:-91.239.143.137}"
+DOMAIN="${DOMAIN:-crm.cifroweek.com}"
+PROJECT_DIR="${PROJECT_DIR:-/opt/bitrix}"
+FTP_USER="${FTP_USER:-ftpadmin}"
+FTP_HOME="/mnt/bitrix/www"
 
+# ?????????? IP ??? SSH/FTP (firewalld mgmt zone + fail2ban ignoreip)
 TRUSTED_IPS=(
   195.54.32.168 37.28.181.201 77.37.135.235 82.149.208.58
   91.239.143.134 91.239.143.135 91.239.143.136 91.239.143.137
@@ -27,55 +46,84 @@ TRUSTED_IPS=(
   107.173.149.222 88.84.205.109 92.50.195.50 83.219.151.30
 )
 
-FTP_USER="ftpadmin"
-FTP_HOME="/mnt/bitrix/www"
+# ==============================================================================
+# ??? 0. Preflight
+# ==============================================================================
+step "0/12 ? Preflight"
 
-# =============================================================================
-# 0. Preflight checks
-# =============================================================================
-step "0. Preflight checks"
+[[ $EUID -eq 0 ]] || fail "?????????? ?? root: sudo bash deploy.sh"
+[[ -d "$PROJECT_DIR" ]] || fail "??????? $PROJECT_DIR ?? ??????.
+  ??????? ??????????? ???????????:
+    git clone <repo_url> $PROJECT_DIR"
 
-[[ $EUID -eq 0 ]] || fail "Run as root (sudo -i)"
-[[ -d "$PROJECT_DIR" ]] || fail "Project dir $PROJECT_DIR not found ? clone the repo first:
-  git clone <repo_url> $PROJECT_DIR"
+# ???????? .env ??????
+MISSING_ENV=0
+for f in .env .env_php .env_sql .env_redis .env_ssl .env_push .env_push_pub .env_push_sub; do
+  if [[ ! -f "$PROJECT_DIR/$f" ]]; then
+    warn "?? ?????? $f ? ?????????? ?? ${f}.example ? ?????????"
+    MISSING_ENV=$((MISSING_ENV+1))
+  fi
+done
+[[ $MISSING_ENV -gt 0 ]] && fail "$MISSING_ENV .env ?????? ??????????? (??. ????)"
+ok ".env ????? ?? ?????"
 
-command -v docker &>/dev/null || fail "Docker not installed. Install Docker CE first:
+# ???????? LVM ????????
+declare -A LVM_EXPECTED=(
+  ["/mnt/bitrix/www"]="??? ?????? (SSD 60G)"
+  ["/mnt/bitrix/cache"]="Bitrix ??? (SSD 120G)"
+  ["/mnt/bitrix/upload"]="????????/???? (SSD 80G)"
+  ["/mnt/bitrix/session"]="PHP ?????? (SSD 10G)"
+  ["/mnt/bitrix/logs"]="???? ???????? (SSD 20G)"
+  ["/var/spool/postfix"]="???????? ??????? (SSD 10G)"
+  ["/var/lib/mysql"]="MySQL data (NVMe 250G)"
+  ["/var/lib/mysql/tmp"]="MySQL tmpdir (NVMe 20G)"
+  ["/var/lib/opensearch"]="OpenSearch ??????? (NVMe 150G)"
+  ["/var/lib/redis"]="Redis AOF/RDB (NVMe 20G)"
+)
+MISSING_MNT=0
+for mp in "${!LVM_EXPECTED[@]}"; do
+  if mountpoint -q "$mp" 2>/dev/null; then
+    ok "  $mp ? ${LVM_EXPECTED[$mp]}"
+  else
+    warn "  $mp ? ?? ??????????? (${LVM_EXPECTED[$mp]})"
+    MISSING_MNT=$((MISSING_MNT+1))
+  fi
+done
+[[ $MISSING_MNT -gt 0 ]] && warn "$MISSING_MNT LVM ???????? ?? ???????????? ? ????????? /etc/fstab"
+
+# ==============================================================================
+# ??? 1. ????????? ??????
+# ==============================================================================
+step "1/12 ? ????????? ??????"
+
+# Docker CE
+if ! command -v docker &>/dev/null; then
+  info "????????????? Docker CE..."
   dnf install -y dnf-plugins-core
   dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
   dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-  systemctl enable --now docker"
+  systemctl enable --now docker
+  ok "Docker CE ??????????"
+else
+  ok "Docker $(docker --version | awk '{print $3}' | tr -d ',') ??? ??????????"
+fi
 
-# Verify LVM mounts
-LVM_MOUNTS=(
-  /mnt/bitrix/www /mnt/bitrix/cache /mnt/bitrix/upload
-  /mnt/bitrix/session /mnt/bitrix/logs /mnt/bitrix/logs
-  /var/spool/postfix /var/lib/mysql /var/lib/mysql/tmp
-  /var/lib/opensearch /var/lib/redis
-)
-MISSING=0
-for mp in "${LVM_MOUNTS[@]}"; do
-  if ! mountpoint -q "$mp" 2>/dev/null; then
-    warn "LVM volume not mounted: $mp"
-    MISSING=$((MISSING+1))
-  fi
-done
-[[ $MISSING -eq 0 ]] && ok "All LVM volumes mounted" || warn "$MISSING LVM mounts missing ? check /etc/fstab and LVM setup"
-
-ok "Preflight done"
-
-# =============================================================================
-# 1. System packages
-# =============================================================================
-step "1. Installing system packages"
-
-dnf install -y vsftpd fail2ban fail2ban-firewalld msmtp 2>/dev/null
+# ?????? ??????
+dnf install -y vsftpd fail2ban fail2ban-firewalld msmtp acl policycoreutils-python-utils 2>/dev/null
 systemctl enable vsftpd fail2ban
-ok "vsftpd, fail2ban, msmtp installed"
+ok "vsftpd, fail2ban, msmtp, acl ???????????"
 
-# =============================================================================
-# 2. vsftpd ? FTP server with FTPS
-# =============================================================================
-step "2. Configuring vsftpd"
+# sysctl: OpenSearch ??????? vm.max_map_count>=262144
+cat > /etc/sysctl.d/99-opensearch.conf << 'SYSCTL'
+vm.max_map_count=262144
+SYSCTL
+sysctl -p /etc/sysctl.d/99-opensearch.conf >/dev/null
+ok "sysctl: vm.max_map_count=262144"
+
+# ==============================================================================
+# ??? 2. vsftpd ? FTP-?????? ? FTPS
+# ==============================================================================
+step "2/12 ? vsftpd"
 
 cat > /etc/vsftpd/vsftpd.conf << VSFTPD
 anonymous_enable=NO
@@ -117,17 +165,18 @@ rsa_cert_file=${PROJECT_DIR}/data/ssl/${DOMAIN}.fullchain.cert.pem
 rsa_private_key_file=${PROJECT_DIR}/data/ssl/${DOMAIN}.key.pem
 VSFTPD
 
-# FTP user
+# FTP ????????????
 if ! id "$FTP_USER" &>/dev/null; then
   useradd -d "$FTP_HOME" -M -s /sbin/nologin "$FTP_USER"
-  info "FTP user $FTP_USER created ? set password: passwd $FTP_USER"
+  warn "FTP ???????????? $FTP_USER ?????? ? ??????? ??????: passwd $FTP_USER"
+else
+  ok "FTP ???????????? $FTP_USER ??? ??????????"
 fi
 echo "$FTP_USER" > /etc/vsftpd/allowed_users
 
-# Ensure vsftpd.log exists (fail2ban needs it even before first connection)
-touch /var/log/vsftpd.log
+touch /var/log/vsftpd.log  # fail2ban ??????? ????????????? ?????
 
-# ACL: ftpadmin can read/write /mnt/bitrix/www
+# ACL: ftpadmin ????? ??????/?????? ? /mnt/bitrix/www
 setfacl -m "u:${FTP_USER}:rwx" "$FTP_HOME" 2>/dev/null || true
 setfacl -d -m "u:${FTP_USER}:rwx" "$FTP_HOME" 2>/dev/null || true
 
@@ -137,82 +186,74 @@ semanage port -a -t ftp_port_t -p tcp 21000-21010 2>/dev/null || \
   semanage port -m -t ftp_port_t -p tcp 21000-21010 2>/dev/null || true
 
 systemctl restart vsftpd
-ok "vsftpd configured and running"
+ok "vsftpd ??????? (FTPS, passive 21000-21010)"
 
-# =============================================================================
-# 3. firewalld ? mgmt zone for trusted IPs, public zone locked down
-# =============================================================================
-step "3. Configuring firewalld"
+# ==============================================================================
+# ??? 3. firewalld
+# ==============================================================================
+step "3/12 ? firewalld"
 
 systemctl enable --now firewalld
 
-# Create mgmt zone
 firewall-cmd --permanent --new-zone=mgmt 2>/dev/null || true
 
-# Trusted IPs ? mgmt zone
 for ip in "${TRUSTED_IPS[@]}"; do
   firewall-cmd --permanent --zone=mgmt --add-source="$ip" 2>/dev/null || true
 done
 
-# mgmt zone: allow SSH, FTP, passive FTP ports
 firewall-cmd --permanent --zone=mgmt --add-service=ssh
 firewall-cmd --permanent --zone=mgmt --add-service=ftp
 firewall-cmd --permanent --zone=mgmt --add-service=cockpit
 firewall-cmd --permanent --zone=mgmt --add-port=21000-21010/tcp
 
-# public zone: remove SSH (only accessible from trusted IPs via mgmt)
-firewall-cmd --permanent --zone=public --remove-service=ssh 2>/dev/null || true
+# ?? public ??????? SSH ? ?????? ????? mgmt zone
+firewall-cmd --permanent --zone=public --remove-service=ssh    2>/dev/null || true
 firewall-cmd --permanent --zone=public --remove-service=cockpit 2>/dev/null || true
-# HTTP/HTTPS handled by Docker (iptables-nft), not firewalld
+# HTTP/HTTPS (80/443) ????????? Docker ????? iptables-nft, ?? firewalld
 
 firewall-cmd --reload
-ok "firewalld configured: mgmt zone with ${#TRUSTED_IPS[@]} trusted IPs, public locked"
+ok "firewalld: ???? mgmt (${#TRUSTED_IPS[@]} IP), public ????????????"
 
-# =============================================================================
-# 4. fail2ban ? 5 jails (sshd, vsftpd, nginx-bitrix-admin, nginx-probe, nginx-limit-req)
-# =============================================================================
-step "4. Configuring fail2ban"
+# ==============================================================================
+# ??? 4. fail2ban ? 5 jail'??
+# ==============================================================================
+step "4/12 ? fail2ban"
 
-# Custom action: block Docker HTTP traffic via DOCKER-USER chain
-cat > /etc/fail2ban/action.d/iptables-docker-user.conf << 'F2B_ACTION'
+# ????????? action ??? ?????????? HTTP-??????? ????? Docker (DOCKER-USER chain)
+cat > /etc/fail2ban/action.d/iptables-docker-user.conf << 'ACT'
 [Definition]
 actionstart = iptables -N f2b-docker-user 2>/dev/null || true
               iptables -C DOCKER-USER -j f2b-docker-user 2>/dev/null || iptables -I DOCKER-USER 1 -j f2b-docker-user
-
-actionstop =  iptables -D DOCKER-USER -j f2b-docker-user 2>/dev/null || true
+actionstop  = iptables -D DOCKER-USER -j f2b-docker-user 2>/dev/null || true
               iptables -F f2b-docker-user 2>/dev/null || true
               iptables -X f2b-docker-user 2>/dev/null || true
-
 actioncheck = iptables -n -L DOCKER-USER 2>/dev/null | grep -q f2b-docker-user
-
-actionban =   iptables -I f2b-docker-user 1 -s <ip> -j DROP
-
+actionban   = iptables -I f2b-docker-user 1 -s <ip> -j DROP
 actionunban = iptables -D f2b-docker-user -s <ip> -j DROP
-F2B_ACTION
+ACT
 
-# Filter: Bitrix admin brute-force
-cat > /etc/fail2ban/filter.d/nginx-bitrix-admin.conf << 'F2B_FILTER_ADMIN'
+# ??????: ???????? ? /bitrix/admin/
+cat > /etc/fail2ban/filter.d/nginx-bitrix-admin.conf << 'FILT'
 [Definition]
 failregex = ^<HOST> -[^"]*"POST /bitrix/admin/[^ ]* HTTP/[0-9.]+" (302|200|401)
             ^<HOST> -[^"]*"(GET|POST) /bitrix/admin/\?login=yes[^ ]* HTTP/[0-9.]+" (302|200|401)
 ignoreregex =
-F2B_FILTER_ADMIN
+FILT
 
-# Filter: vulnerability scanners / bots
-cat > /etc/fail2ban/filter.d/nginx-probe.conf << 'F2B_FILTER_PROBE'
+# ??????: ??????? ? ????
+cat > /etc/fail2ban/filter.d/nginx-probe.conf << 'FILT'
 [Definition]
 failregex = ^<HOST> -[^"]*"(GET|POST|HEAD) /(wp-admin|wp-login|phpmyadmin|pma|admin|administrator|xmlrpc\.php|\.env|\.git|shell|backdoor|c99|r57|eval)[^ ]* HTTP/[0-9.]+" (200|404|403|400|500)
             ^<HOST> -[^"]*"(GET|POST) /[^ ]*\.(php|asp|aspx|jsp|cgi)[^ ]* HTTP/[0-9.]+" 404
             ^<HOST> -[^"]*"-" 400 \d+
 ignoreregex = ^<HOST> -[^"]*"/bitrix/
-F2B_FILTER_PROBE
+FILT
 
-# Build ignoreip list
+# ???????? ignoreip
 IGNOREIP="127.0.0.1/8 ::1"
 for ip in "${TRUSTED_IPS[@]}"; do IGNOREIP="$IGNOREIP $ip"; done
 
-# Main jail config
-cat > /etc/fail2ban/jail.d/bitrix-security.conf << F2B_JAIL
+cat > /etc/fail2ban/jail.d/bitrix-security.conf << JAIL
 [DEFAULT]
 ignoreip = ${IGNOREIP}
 bantime  = 3600
@@ -265,75 +306,91 @@ logpath  = /mnt/bitrix/logs/nginx/access.log
 maxretry = 3
 bantime  = 600
 action   = iptables-docker-user
-F2B_JAIL
+JAIL
 
 systemctl restart fail2ban
-ok "fail2ban configured: 5 jails active"
+ok "fail2ban: 5 jail'?? (sshd, vsftpd, nginx-bitrix-admin, nginx-probe, nginx-limit-req)"
 
-# =============================================================================
-# 5. /opt/bitrix/volumes/ symlinks ? project-local access to all LVM mounts
-# =============================================================================
-step "5. Creating volume symlinks"
+# ==============================================================================
+# ??? 5. ???????? /opt/bitrix/volumes/ ? ??? LVM ????? ????????????
+# ==============================================================================
+step "5/12 ? ???????? volumes/"
 
 mkdir -p "${PROJECT_DIR}/volumes"
-
 declare -A SYMLINKS=(
-  ["www"]="/mnt/bitrix/www"
-  ["upload"]="/mnt/bitrix/upload"
-  ["cache"]="/mnt/bitrix/cache"
-  ["session"]="/mnt/bitrix/session"
-  ["logs"]="/mnt/bitrix/logs"
-  ["postfix"]="/var/spool/postfix"
-  ["mysql"]="/var/lib/mysql"
-  ["mysql-tmp"]="/var/lib/mysql/tmp"
-  ["opensearch"]="/var/lib/opensearch"
-  ["redis"]="/var/lib/redis"
-  ["docker"]="/var/lib/docker"
-  ["backup"]="/var/backup"
+  ["www"]="/mnt/bitrix/www"          # SSD ? ??? ??????
+  ["upload"]="/mnt/bitrix/upload"    # SSD ? ????????
+  ["cache"]="/mnt/bitrix/cache"      # SSD ? Bitrix ???
+  ["session"]="/mnt/bitrix/session"  # SSD ? PHP ??????
+  ["logs"]="/mnt/bitrix/logs"        # SSD ? ????
+  ["postfix"]="/var/spool/postfix"   # SSD ? ???????? ???????
+  ["mysql"]="/var/lib/mysql"         # NVMe ? MySQL data
+  ["mysql-tmp"]="/var/lib/mysql/tmp" # NVMe ? MySQL tmpdir
+  ["opensearch"]="/var/lib/opensearch" # NVMe ? OpenSearch ???????
+  ["redis"]="/var/lib/redis"         # NVMe ? Redis AOF/RDB
+  ["docker"]="/var/lib/docker"       # HDD ? Docker images/overlay2
+  ["backup"]="/var/backup"           # HDD ? ????????? ?????
 )
-
 for name in "${!SYMLINKS[@]}"; do
   ln -sfn "${SYMLINKS[$name]}" "${PROJECT_DIR}/volumes/${name}"
+  ok "  volumes/${name} ? ${SYMLINKS[$name]}"
 done
-ok "Symlinks created in ${PROJECT_DIR}/volumes/"
 
-# =============================================================================
-# 6. Upload directory ? migrate from www/upload/ to dedicated LV
-# =============================================================================
-step "6. Setting up upload directory"
+# ==============================================================================
+# ??? 6. ?????????? ????????
+# ==============================================================================
+step "6/12 ? Upload ??????????"
 
 SRC="$FTP_HOME/upload"
 DST="/mnt/bitrix/upload"
 
+# ???????? ?????? ?? www/upload/ ? ?????????? LV (???? ?? ????? ? ?????? ?????)
 if [[ -d "$SRC" ]] && [[ "$(ls -A "$SRC" 2>/dev/null)" ]]; then
-  info "Migrating $SRC ? $DST ..."
+  info "????????????? $SRC ? $DST ..."
   rsync -a --ignore-existing "$SRC/" "$DST/"
-  ok "Upload data migrated"
-else
-  ok "Upload source empty ? nothing to migrate"
+  ok "?????? ???????? ??????????"
 fi
 
-# Fix ownership (UID 979 = bitrix user inside containers)
+# UID 979 = bitrix ?????? ??????????? (quay.io/bitrix24/*)
 chown -R 979:979 "$DST"
 restorecon -R "$DST" 2>/dev/null || true
-ok "Upload dir ownership fixed (979:979)"
+ok "Upload: ???????? 979:979, SELinux ???????? ????????????"
 
-# =============================================================================
-# 7. MySQL tmpdir ownership (NVMe LV for large sort operations)
-# =============================================================================
-step "7. MySQL tmpdir setup"
+# ??????? ??????????? ????????????? ??? Bitrix
+for subdir in tmp resize_cache iblock; do
+  mkdir -p "${DST}/${subdir}"
+  chown 979:979 "${DST}/${subdir}"
+done
+ok "Upload: ??????? ????????????? ???????"
+
+# ==============================================================================
+# ??? 7. ????? ??? ????? ??? ??????
+# ==============================================================================
+step "7/12 ? ????? ????? ??"
+
+# MySQL tmpdir (NVMe LV, 20G)
 chown -R 979:979 /var/lib/mysql/tmp 2>/dev/null || true
 restorecon -R /var/lib/mysql/tmp 2>/dev/null || true
-ok "MySQL tmpdir /var/lib/mysql/tmp ready"
+ok "MySQL tmpdir: /var/lib/mysql/tmp ? 979:979"
 
-# =============================================================================
-# 8. msmtp config for PHP/cron containers
-# =============================================================================
-step "8. msmtp relay config"
+# ?????????? ?????????? ??? fallback (?? ?????? ????? handler)
+chown -R 979:979 /mnt/bitrix/session 2>/dev/null || true
+restorecon -R /mnt/bitrix/session 2>/dev/null || true
+ok "Sessions dir: /mnt/bitrix/session ? 979:979"
+
+# ???-??????????
+mkdir -p /mnt/bitrix/logs/{nginx,mysql,opensearch}
+restorecon -R /mnt/bitrix/logs 2>/dev/null || true
+ok "???-????????????? ???????"
+
+# ==============================================================================
+# ??? 8. msmtp ? relay-?????? ??? PHP/cron ???????????
+# ==============================================================================
+step "8/12 ? msmtp relay config"
 
 mkdir -p "${PROJECT_DIR}/data/msmtp"
 cat > "${PROJECT_DIR}/data/msmtp/msmtprc" << 'MSMTP'
-# msmtp config: relay through postfix container (no auth needed inside Docker network)
+# msmtp: relay ????? postfix-????????? (??? auth ?????? Docker-????)
 defaults
 auth           off
 tls            off
@@ -345,74 +402,180 @@ port           25
 
 account default : relay
 MSMTP
-ok "msmtp config written"
+ok "msmtp config: PHP ? postfix:25 ? smtp.mail.ru:587"
 
-# =============================================================================
-# 9. Build Postfix Docker image
-# =============================================================================
-step "9. Building Postfix Docker image"
+# ==============================================================================
+# ??? 9. SELinux: ????????? Docker + iptables
+# ==============================================================================
+step "9/12 ? SELinux ????????"
+
+# Docker ?????? ????? ?????? ? ???????????????? LVM-???????????
+for dir in /mnt/bitrix/www /mnt/bitrix/cache /mnt/bitrix/upload \
+            /mnt/bitrix/session /mnt/bitrix/logs \
+            /var/lib/mysql /var/lib/mysql/tmp \
+            /var/lib/opensearch /var/lib/redis /var/spool/postfix; do
+  restorecon -R "$dir" 2>/dev/null || true
+done
+ok "SELinux ????????? ????????? ? LVM-????????"
+
+# ==============================================================================
+# ??? 10. Docker ????: ?????? + ??????
+# ==============================================================================
+step "10/12 ? Docker ????"
+
 cd "${PROJECT_DIR}"
+
+# ?????? ?????? Postfix (debian:bookworm-slim + postfix + libsasl2)
+info "???????? ????? postfix..."
 docker build -t bitrix_postfix:latest ./confs/postfix/
-ok "Postfix image built"
+ok "????? bitrix_postfix:latest ??????"
 
-# =============================================================================
-# 10. Docker stack up
-# =============================================================================
-step "10. Starting Docker stack"
-cd "${PROJECT_DIR}"
+# ?????? ????? ?????
+info "????????? ???? (10 ???????????)..."
 docker compose up -d
-ok "Docker stack started"
+ok "Docker compose up ????????"
 
-# =============================================================================
-# 11. Verification
-# =============================================================================
-step "11. Verification"
+info "???? ????????????? ???????? (30 ???)..."
+sleep 30
 
-sleep 15  # wait for containers to stabilize
+# ==============================================================================
+# ??? 11. ???????????
+# ==============================================================================
+step "11/12 ? ???????????"
 
 FAILED=0
 
-# Check all containers running
-CONTAINERS=(bitrix_redis bitrix_mysql bitrix_opensearch bitrix_php bitrix_cron bitrix_nginx bitrix_push_sub bitrix_push_pub bitrix_postfix bitrix_ssl)
-for c in "${CONTAINERS[@]}"; do
+# --- ?????????? ---
+echo
+info "?????? ???????????:"
+declare -A CONTAINERS=(
+  ["bitrix_redis"]="Redis 8.x"
+  ["bitrix_mysql"]="Percona MySQL 8.0"
+  ["bitrix_opensearch"]="OpenSearch 2.x"
+  ["bitrix_php"]="PHP 8.2-FPM"
+  ["bitrix_cron"]="PHP cron"
+  ["bitrix_nginx"]="nginx"
+  ["bitrix_push_sub"]="push-server sub"
+  ["bitrix_push_pub"]="push-server pub"
+  ["bitrix_postfix"]="Postfix SMTP relay"
+  ["bitrix_ssl"]="SSL manager"
+)
+for c in "${!CONTAINERS[@]}"; do
   STATUS=$(docker inspect --format '{{.State.Status}}' "$c" 2>/dev/null || echo "missing")
+  RESTARTS=$(docker inspect --format '{{.RestartCount}}' "$c" 2>/dev/null || echo "?")
   if [[ "$STATUS" == "running" ]]; then
-    ok "  $c: running"
+    ok "  ${CONTAINERS[$c]} ($c): running, restarts=$RESTARTS"
   else
-    warn "  $c: $STATUS"
+    warn "  ${CONTAINERS[$c]} ($c): $STATUS"
     FAILED=$((FAILED+1))
   fi
 done
 
-# HTTP check
-HTTP_CODE=$(curl -skI "https://${DOMAIN}/" | head -1 | awk '{print $2}')
-if [[ "$HTTP_CODE" == "200" ]]; then
-  ok "  Site https://${DOMAIN}/ ? HTTP $HTTP_CODE"
+# --- MySQL ---
+echo
+info "MySQL:"
+MYSQL_PASS=$(grep MYSQL_ROOT_PASSWORD "${PROJECT_DIR}/.env_sql" | cut -d= -f2 | tr -d '"')
+if docker exec bitrix_mysql mysql -uroot "-p${MYSQL_PASS}" -e "SELECT 1" &>/dev/null 2>&1; then
+  BUF=$(docker exec bitrix_mysql mysql -uroot "-p${MYSQL_PASS}" -e \
+    "SELECT variable_value FROM performance_schema.global_variables WHERE variable_name='innodb_buffer_pool_size'" \
+    2>/dev/null | tail -1)
+  BUF_GB=$((BUF / 1073741824))
+  ok "  MySQL ????????, innodb_buffer_pool_size=${BUF_GB}G"
 else
-  warn "  Site https://${DOMAIN}/ ? HTTP $HTTP_CODE"
+  warn "  MySQL ?? ????????"
   FAILED=$((FAILED+1))
 fi
 
-# fail2ban
-F2B_STATUS=$(fail2ban-client ping 2>/dev/null | grep -c "pong" || echo 0)
-[[ "$F2B_STATUS" -gt 0 ]] && ok "  fail2ban: running" || warn "  fail2ban: not responding"
-
+# --- Redis ---
 echo
-if [[ $FAILED -eq 0 ]]; then
-  echo -e "${GREEN}============================================${NC}"
-  echo -e "${GREEN}  Deploy complete ? all checks passed!${NC}"
-  echo -e "${GREEN}============================================${NC}"
+info "Redis:"
+PONG=$(docker exec bitrix_redis redis-cli PING 2>/dev/null || echo "")
+MEM=$(docker exec bitrix_redis redis-cli CONFIG GET maxmemory 2>/dev/null | tail -1 || echo "?")
+MEM_GB=$((MEM / 1073741824))
+if [[ "$PONG" == "PONG" ]]; then
+  ok "  Redis ????????, maxmemory=${MEM_GB}G"
 else
-  echo -e "${YELLOW}============================================${NC}"
-  echo -e "${YELLOW}  Deploy done with $FAILED warning(s)${NC}"
-  echo -e "${YELLOW}  Check logs: docker logs <container_name>${NC}"
-  echo -e "${YELLOW}============================================${NC}"
+  warn "  Redis ?? ????????"
+  FAILED=$((FAILED+1))
+fi
+
+# --- Redis ?????? ---
+SESSION_HANDLER=$(docker exec bitrix_php php -r "echo ini_get('session.save_handler');" 2>/dev/null || echo "?")
+SESSION_PATH=$(docker exec bitrix_php php -r "echo ini_get('session.save_path');" 2>/dev/null || echo "?")
+if [[ "$SESSION_HANDLER" == "redis" ]]; then
+  ok "  PHP ??????: handler=$SESSION_HANDLER path=$SESSION_PATH"
+else
+  warn "  PHP ?????? ?????????? '$SESSION_HANDLER' ?????? redis"
+fi
+
+# --- OpenSearch ---
+echo
+info "OpenSearch:"
+OS_HEALTH=$(curl -sk "http://localhost:9200/_cluster/health" 2>/dev/null || echo "")
+if echo "$OS_HEALTH" | grep -q '"status":"green"\|"status":"yellow"'; then
+  OS_STATUS=$(echo "$OS_HEALTH" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status','?'))" 2>/dev/null || echo "ok")
+  ok "  OpenSearch health: $OS_STATUS"
+else
+  # OpenSearch ??????? ?????? ?????? Docker-????
+  OS_HEALTH=$(docker exec bitrix_php wget -qO- "http://opensearch:9200/_cluster/health" 2>/dev/null || echo "")
+  if echo "$OS_HEALTH" | grep -q '"status"'; then
+    ok "  OpenSearch ???????? (????? Docker ????)"
+  else
+    warn "  OpenSearch: ??? ?????? (????????? ??? ?????? ??????, ????? 1-2 ???)"
+  fi
+fi
+
+# --- Postfix ---
+echo
+info "Postfix:"
+PF_STATUS=$(docker exec bitrix_postfix postfix status 2>&1 | head -1 || echo "?")
+ok "  Postfix: $PF_STATUS"
+
+# --- HTTP ---
+echo
+info "HTTP:"
+HTTP_CODE=$(curl -skI "https://${DOMAIN}/" --max-time 10 | head -1 | awk '{print $2}')
+if [[ "$HTTP_CODE" =~ ^(200|301|302)$ ]]; then
+  ok "  https://${DOMAIN}/ ? HTTP $HTTP_CODE"
+else
+  warn "  https://${DOMAIN}/ ? HTTP $HTTP_CODE (???? ????? ????????? ? ???????? ?????? ?????????)"
+  # ?? ??????? ??? ??????? ??? ?????? ??????
+fi
+
+# --- fail2ban ---
+F2B=$(fail2ban-client ping 2>/dev/null | grep -c "pong" || echo 0)
+[[ "$F2B" -gt 0 ]] && ok "  fail2ban: ???????, ?????? ????????" || warn "  fail2ban: ?? ????????"
+
+# ==============================================================================
+# ??? 12. ????
+# ==============================================================================
+step "12/12 ? ????"
+echo
+
+if [[ $FAILED -eq 0 ]]; then
+  echo -e "${GREEN}????????????????????????????????????????????????????????????${NC}"
+  echo -e "${GREEN}?   ?????? ???????? ??????? ? ??? ???????? ????????!      ?${NC}"
+  echo -e "${GREEN}????????????????????????????????????????????????????????????${NC}"
+else
+  echo -e "${YELLOW}????????????????????????????????????????????????????????????${NC}"
+  echo -e "${YELLOW}?   ?????? ???????? ? ????????????????: $FAILED           ?${NC}"
+  echo -e "${YELLOW}?   ???????? ????? ???? ? ???? ???????????                ?${NC}"
+  echo -e "${YELLOW}????????????????????????????????????????????????????????????${NC}"
 fi
 
 echo
-echo "Useful commands:"
-echo "  docker ps                                  ? container status"
-echo "  docker logs bitrix_mysql                   ? MySQL logs"
-echo "  fail2ban-client status                     ? active jails"
-echo "  fail2ban-client status nginx-probe         ? banned IPs"
-echo "  docker exec bitrix_redis redis-cli -n 1 DBSIZE  ? PHP sessions in Redis"
+echo -e "${CYAN}???????? ??????? ????? ??????:${NC}"
+echo "  docker ps                                     ? ?????? ???????????"
+echo "  docker logs bitrix_mysql --tail 50            ? ???? MySQL"
+echo "  docker logs bitrix_postfix --tail 50          ? ???? Postfix / ???????? ?????"
+echo "  fail2ban-client status                        ? ???????? ??????"
+echo "  fail2ban-client status nginx-probe            ? ?????????? IP"
+echo "  docker exec bitrix_redis redis-cli -n 1 DBSIZE ? PHP-?????? ? Redis"
+echo "  ls -la ${PROJECT_DIR}/volumes/                ? ???????? ?? LVM-????"
+echo
+echo -e "${CYAN}?????? ?????? (????? ??):${NC}"
+echo "  ???????? https://${DOMAIN}/bitrix/wizard/"
+echo "  ???????? ??????? ????????? ???????"
+echo
+echo -e "${CYAN}???? ????? ???????? ?????? FTP:${NC}"
+echo "  passwd ${FTP_USER}"

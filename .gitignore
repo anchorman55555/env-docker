@@ -1,6 +1,7 @@
 # Secrets & credentials
 .env
 .env_*
+!.env*.example
 *.key.pem
 *.key
 sasl_passwd
