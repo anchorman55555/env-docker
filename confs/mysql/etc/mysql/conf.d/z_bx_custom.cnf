@@ -1,0 +1,7 @@
+[mysqld]
+datadir = /var/lib/mysql/data
+tmpdir = /tmp
+character-set-server = utf8mb4
+collation-server = utf8mb4_unicode_ci
+innodb_buffer_pool_size = 1G
+max_allowed_packet = 256M

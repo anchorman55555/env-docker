@@ -1,74 +1,24 @@
 networks:
-  dev:
+  bitrix:
     driver: bridge
     attachable: true
     internal: false
     ipam:
       driver: default
       config:
-        - subnet: 10.10.10.0/24
-volumes:
-  redis_data:
-    driver: local
-  mysql_log_data:
-    driver: local
-  mysql_lib_data:
-    driver: local
-  postgres_data:
-    driver: local
-  www_data:
-    driver: local
-  bxtemp_data:
-    driver: local
-  msmtp_data:
-    driver: local
-  browscap_data:
-    driver: local
-  geoip2_data:
-    driver: local
-  ssl_data:
-    driver: local
+        - subnet: 10.20.10.0/24
+
 services:
-  memcached:
-    image: memcached:1.6.42-alpine
-    container_name: dev_memcached
-    restart: unless-stopped
-    env_file:
-      - .env
-#    ports:
-#      - "11211:11211"
-    init: true
-    cgroup: private
-    security_opt:
-      - no-new-privileges
-    cap_drop:
-      - ALL
-    tmpfs:
-      - /tmp:noexec,nodev,nosuid
-      - /var/tmp:noexec,nodev,nosuid
-      - /dev/shm:noexec,nodev,nosuid
-    networks:
-      dev:
-        aliases:
-          - memcached
   redis:
-    #image: redis:7.2.14-alpine
-    #image: redis:7.4.9-alpine
-    #image: redis:8.0.6-alpine
     image: redis:8.2.7-alpine
-    #image: redis:8.4.4-alpine
-    #image: redis:8.6.4-alpine
-    #image: redis:8.8.0-alpine
-    container_name: dev_redis
+    container_name: bitrix_redis
     restart: unless-stopped
     command: redis-server /usr/local/etc/redis/redis.conf
     env_file:
       - .env
-#    ports:
-#      - "6379:6379"
     volumes:
-      - redis_data:/data
-      - ./confs/redis/redis.conf:/usr/local/etc/redis/redis.conf
+      - /var/lib/redis:/data:z
+      - ./confs/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro,z
     init: true
     cgroup: private
     security_opt:
@@ -84,65 +34,30 @@ services:
       - /var/tmp:noexec,nodev,nosuid
       - /dev/shm:noexec,nodev,nosuid
     networks:
-      dev:
+      bitrix:
         aliases:
           - redis
-  postgres:
-    #image: postgres:14.23-trixie
-    #image: postgres:15.18-trixie
-    image: postgres:16.14-trixie
-    #image: postgres:17.10-trixie
-    #image: postgres:18.4-trixie
-    container_name: dev_postgres
-    restart: unless-stopped
-    env_file:
-      - .env
-      - .env_sql
-#    ports:
-#      - "5432:5432"
-    volumes:
-      # for postgresql 14.x - 17.x
-      - postgres_data:/var/lib/postgresql/data
-      # for postgresql 18.x
-      #- postgres_data:/var/lib/postgresql
-    init: true
-    cgroup: private
-    security_opt:
-      - no-new-privileges
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - FOWNER
-      - SETUID
-      - SETGID
-      - DAC_OVERRIDE
-    tmpfs:
-      - /tmp:noexec,nodev,nosuid
-      - /var/tmp:noexec,nodev,nosuid
-      - /dev/shm:noexec,nodev,nosuid
-    networks:
-      dev:
-        aliases:
-          - postgres
+
   mysql:
     image: quay.io/bitrix24/percona-server:8.0.45-v1-rhel
-    #image: quay.io/bitrix24/percona-server:8.4.8-v1-rhel
-    container_name: dev_mysql
+    container_name: bitrix_mysql
     restart: unless-stopped
     env_file:
       - .env
       - .env_sql
-#    ports:
-#      - "3306:3306"
-#      - "33060:33060"
     volumes:
-      - mysql_log_data:/var/log/mysql
-      - mysql_lib_data:/var/lib/mysql
+      - /var/lib/mysql/data:/var/lib/mysql:z
+      - /var/lib/mysql/tmp:/var/lib/mysql/tmp:z
+      - /mnt/bitrix/logs/mysql:/var/log/mysql:z
+      - ./confs/mysql/etc/my.cnf.d:/etc/my.cnf.d:ro,z
     init: true
     cgroup: private
     security_opt:
       - no-new-privileges
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     cap_drop:
       - ALL
     cap_add:
@@ -152,30 +67,67 @@ services:
       - /var/tmp:noexec,nodev,nosuid
       - /dev/shm:noexec,nodev,nosuid
     networks:
-      dev:
+      bitrix:
         aliases:
           - mysql
+
+  opensearch:
+    image: opensearchproject/opensearch:2.18.0
+    container_name: bitrix_opensearch
+    restart: unless-stopped
+    environment:
+      - cluster.name=bitrix-cluster
+      - node.name=bitrix-node
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_JAVA_OPTS=-Xms4g -Xmx4g
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+      - plugins.security.disabled=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - /var/lib/opensearch:/usr/share/opensearch/data:z
+      - /mnt/bitrix/logs/opensearch:/usr/share/opensearch/logs:z
+    init: true
+    security_opt:
+      - no-new-privileges
+    cap_drop:
+      - ALL
+    cap_add:
+      - IPC_LOCK
+      - SYS_RESOURCE
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - FOWNER
+    networks:
+      bitrix:
+        aliases:
+          - opensearch
+
   php:
     image: quay.io/bitrix24/php:8.2.31-fpm-v1-alpine
-    #image: quay.io/bitrix24/php:8.3.31-fpm-v1-alpine
-    #image: quay.io/bitrix24/php:8.4.21-fpm-v1-alpine
-    container_name: dev_php
+    container_name: bitrix_php
     restart: unless-stopped
     env_file:
       - .env
       - .env_php
-#    ports:
-#      - "9000:9000"
     volumes:
-      - ./confs/php82/etc/:/usr/local/etc/
-      #- ./confs/php83/etc/:/usr/local/etc/
-      #- ./confs/php84/etc/:/usr/local/etc/
-      - www_data:/opt/www/
-      - bxtemp_data:/opt/.bx_temp/
-      - msmtp_data:/opt/msmtp/
-      - browscap_data:/opt/browscap/
-      - geoip2_data:/opt/geoip2/
-      - ssl_data:/ssl/
+      - ./confs/php82/etc/:/usr/local/etc/:z
+      - /mnt/bitrix/www:/opt/www/:z
+      - /mnt/bitrix/upload:/opt/www/upload/:z
+      - /mnt/bitrix/cache:/opt/.bx_temp/:z
+      - /mnt/bitrix/session:/php_sessions:z
+      - /opt/bitrix/data/msmtp:/opt/msmtp/:z
+      - /opt/bitrix/data/browscap:/opt/browscap/:z
+      - /opt/bitrix/data/geoip2:/opt/geoip2/:z
+      - /opt/bitrix/data/ssl:/ssl/:z
     init: true
     cgroup: private
     security_opt:
@@ -187,26 +139,73 @@ services:
       - /var/tmp:noexec,nodev,nosuid
       - /dev/shm:noexec,nodev,nosuid
     networks:
-      dev:
+      bitrix:
         aliases:
           - php
     depends_on:
       - mysql
-      - postgres
+      - redis
+      - postfix
+
+  cron:
+    image: quay.io/bitrix24/php:8.2.31-fpm-v1-alpine
+    container_name: bitrix_cron
+    restart: unless-stopped
+    command: crond -f -d 8
+    user: root
+    env_file:
+      - .env
+      - .env_php
+    volumes:
+      - ./confs/php82/etc/:/usr/local/etc/:z
+      - ./confs/cron/crontabs_root:/etc/crontabs/root:ro,z
+      - /mnt/bitrix/www:/opt/www/:z
+      - /mnt/bitrix/upload:/opt/www/upload/:z
+      - /mnt/bitrix/cache:/opt/.bx_temp/:z
+      - /opt/bitrix/data/msmtp:/opt/msmtp/:z
+      - /opt/bitrix/data/browscap:/opt/browscap/:z
+      - /opt/bitrix/data/geoip2:/opt/geoip2/:z
+    init: true
+    cgroup: private
+    security_opt:
+      - no-new-privileges
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+    tmpfs:
+      - /tmp:noexec,nodev,nosuid
+      - /var/tmp:noexec,nodev,nosuid
+      - /dev/shm:noexec,nodev,nosuid
+    networks:
+      bitrix:
+        aliases:
+          - cron
+    depends_on:
+      - php
+      - postfix
+
   nginx:
     image: quay.io/bitrix24/nginx:1.30.2-v1-alpine
-    container_name: dev_nginx
+    container_name: bitrix_nginx
     restart: unless-stopped
     env_file:
       - .env
     ports:
-      - "8588:80"
-      - "8589:443"
+      - "80:80"
+      - "443:443"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     volumes:
-      - ./confs/nginx/:/etc/nginx/
-      - www_data:/opt/www/
-      - bxtemp_data:/opt/.bx_temp/
-      - ssl_data:/ssl/
+      - ./confs/nginx/:/etc/nginx/:z
+      - /mnt/bitrix/www:/opt/www/:z
+      - /mnt/bitrix/upload:/opt/www/upload/:z
+      - /mnt/bitrix/cache:/opt/.bx_temp/:z
+      - /opt/bitrix/data/ssl:/ssl/:z
+      - /mnt/bitrix/logs/nginx:/var/log/nginx:z
     init: true
     cgroup: private
     security_opt:
@@ -223,20 +222,22 @@ services:
       - /var/tmp:noexec,nodev,nosuid
       - /dev/shm:noexec,nodev,nosuid
     networks:
-      dev:
+      bitrix:
         aliases:
           - nginx
+    depends_on:
+      - php
+      - postfix
+
   push-sub:
     image: quay.io/bitrix24/push:3.3-v1-alpine
-    container_name: dev_push_sub
+    container_name: bitrix_push_sub
     restart: unless-stopped
     env_file:
       - .env
       - .env_push
       - .env_push_sub
       - .env_redis
-#    ports:
-#      - "8010:8010"
     init: true
     cgroup: private
     security_opt:
@@ -248,22 +249,21 @@ services:
       - /var/tmp:noexec,nodev,nosuid
       - /dev/shm:noexec,nodev,nosuid
     networks:
-      dev:
+      bitrix:
         aliases:
           - push_sub
     depends_on:
       - redis
+
   push-pub:
     image: quay.io/bitrix24/push:3.3-v1-alpine
-    container_name: dev_push_pub
+    container_name: bitrix_push_pub
     restart: unless-stopped
     env_file:
       - .env
       - .env_push
       - .env_push_pub
       - .env_redis
-#    ports:
-#      - "9010:9010"
     init: true
     cgroup: private
     security_opt:
@@ -275,60 +275,32 @@ services:
       - /var/tmp:noexec,nodev,nosuid
       - /dev/shm:noexec,nodev,nosuid
     networks:
-      dev:
+      bitrix:
         aliases:
           - push_pub
     depends_on:
       - redis
-  sphinx:
-    image: quay.io/bitrix24/sphinx:2.2.11-v2-alpine
-    container_name: dev_sphinx
-#    ports:
-#      - "9306:9306"
-#      - "9312:9312"
+
+  postfix:
+    image: bitrix_postfix:latest
+    container_name: bitrix_postfix
     restart: unless-stopped
-    env_file:
-      - .env
+    hostname: crm.cifroweek.com
+    environment:
+      SMTP_SERVER: smtp.mail.ru
+      SMTP_PORT: "587"
+      HELO_NAME: crm.cifroweek.com
+      SMTP_SECURITY: encrypt
+      SMTP_LOGIN_PORTAL: info@crm.cifroweek.com
+      SMTP_PASSWORD_PORTAL: sZnmbBeIHVldtbf9xgoW
+      SMTP_LOGIN_SHOP: info@cifroweek.com
+      SMTP_PASSWORD_SHOP: gF7Be6guXbmDllUUVsyL
+      SMTP_DEFAULT_LOGIN: info@crm.cifroweek.com
+      SMTP_DEFAULT_PASSWORD: sZnmbBeIHVldtbf9xgoW
+      MYNETWORKS: "127.0.0.0/8 10.20.10.0/24"
     volumes:
-      - ./confs/sphinx/sphinx.conf:/opt/sphinx/conf/sphinx.conf
+      - /var/spool/postfix:/var/spool/postfix:z
     init: true
-    cgroup: private
-    security_opt:
-      - no-new-privileges
-    cap_drop:
-      - ALL
-    tmpfs:
-      - /tmp:noexec,nodev,nosuid
-      - /var/tmp:noexec,nodev,nosuid
-      - /dev/shm:noexec,nodev,nosuid
-    networks:
-      dev:
-        aliases:
-          - sphinx
-  cron:
-    image: quay.io/bitrix24/php:8.2.31-fpm-v1-alpine
-    #image: quay.io/bitrix24/php:8.3.31-fpm-v1-alpine
-    #image: quay.io/bitrix24/php:8.4.21-fpm-v1-alpine
-    container_name: dev_cron
-    restart: unless-stopped
-    command: crond -f -d 8
-    user: root
-    env_file:
-      - .env
-      - .env_php
-#    ports:
-#      - "9001:9000"
-    volumes:
-      - ./confs/php82/etc/:/usr/local/etc/
-      #- ./confs/php83/etc/:/usr/local/etc/
-      #- ./confs/php84/etc/:/usr/local/etc/
-      - www_data:/opt/www/
-      - bxtemp_data:/opt/.bx_temp/
-      - msmtp_data:/opt/msmtp/
-      - browscap_data:/opt/browscap/
-      - geoip2_data:/opt/geoip2/
-    init: true
-    cgroup: private
     security_opt:
       - no-new-privileges
     cap_drop:
@@ -336,25 +308,26 @@ services:
     cap_add:
       - SETUID
       - SETGID
-    tmpfs:
-      - /tmp:noexec,nodev,nosuid
-      - /var/tmp:noexec,nodev,nosuid
-      - /dev/shm:noexec,nodev,nosuid
+      - CHOWN
+      - FOWNER
+      - DAC_OVERRIDE
+      - NET_BIND_SERVICE
+      - SYS_CHROOT
     networks:
-      dev:
+      bitrix:
         aliases:
-          - cron
-    depends_on:
-      - php
+          - postfix
+
+
   ssl:
     image: quay.io/bitrix24/ssl:1.2-v1-alpine
-    container_name: dev_ssl
+    container_name: bitrix_ssl
     restart: unless-stopped
     env_file:
       - .env
       - .env_ssl
     volumes:
-      - ssl_data:/ssl/
+      - /opt/bitrix/data/ssl:/ssl/:z
     init: true
     cgroup: private
     security_opt:
@@ -371,34 +344,8 @@ services:
       - /var/tmp:noexec,nodev,nosuid
       - /dev/shm:noexec,nodev,nosuid
     networks:
-      dev:
+      bitrix:
         aliases:
           - ssl
-    depends_on:
-      - nginx
-  lego:
-    image: quay.io/bitrix24/lego:4.35.2-v1-alpine
-    container_name: dev_lego
-    restart: unless-stopped
-    env_file:
-      - .env
-    ports:
-      - "80:80"
-    volumes:
-      - ssl_data:/ssl/
-    init: true
-    cgroup: private
-    security_opt:
-      - no-new-privileges
-    cap_drop:
-      - ALL
-    tmpfs:
-      - /tmp:noexec,nodev,nosuid
-      - /var/tmp:noexec,nodev,nosuid
-      - /dev/shm:noexec,nodev,nosuid
-    networks:
-      dev:
-        aliases:
-          - lego
     depends_on:
       - nginx

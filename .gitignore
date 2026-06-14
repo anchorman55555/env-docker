@@ -1,0 +1,24 @@
+# Secrets & credentials
+.env
+.env_*
+*.key.pem
+*.key
+sasl_passwd
+sasl_passwd.db
+sender_relay
+sender_relay.db
+
+# SSL ? public certs OK to commit, private keys never
+data/ssl/root_ca/private/
+data/ssl/intermediate_ca/private/
+data/ssl/servers/private/
+data/ssl/*.key.pem
+
+# Symlinks to host volumes (host-specific, not portable)
+volumes/
+
+# Runtime / generated
+*.db
+*.log
+__pycache__/
+*.pyc

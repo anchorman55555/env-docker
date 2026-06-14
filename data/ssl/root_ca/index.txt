@@ -1,0 +1,1 @@
+V	380611152630Z		1000	unknown	/C=RU/ST=Moscow/O=CifroWeek/OU=CifroWeek Certificate Authority/CN=CifroWeek Intermediate CA
