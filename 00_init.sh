@@ -57,18 +57,57 @@ phase1() {
     dnf config-manager --set-enabled epel
     ok "EPEL установлен"
 
-    # --- XCP-ng guest tools ---------------------------------------------------
-    step "1.3 — XCP-ng / Citrix guest tools"
-    if dnf list available xe-guest-utilities-latest &>/dev/null; then
-        dnf install -y xe-guest-utilities-latest
-        systemctl enable --now xe-linux-distribution.service
-        ok "XCP-ng guest tools установлены и запущены"
-    else
-        warn "xe-guest-utilities-latest не найден в репозиториях"
-        warn "Если сервер на XCP-ng/XenServer — добавьте репозиторий xe-guest-utilities вручную:"
-        warn "  dnf install -y https://kojipkgs.fedoraproject.org/.../xe-guest-utilities-latest.rpm"
-        warn "Пропускаем (не критично для работы стека)"
-    fi
+    # --- Guest tools: определяем гипервизор и ставим нужные инструменты ------
+    step "1.3 — Guest tools (определение платформы виртуализации)"
+    VIRT=$(systemd-detect-virt 2>/dev/null || echo "none")
+    ok "Платформа: ${VIRT}"
+
+    case "$VIRT" in
+        xen)
+            # XCP-ng / XenServer / Citrix Hypervisor
+            ok "XCP-ng / Xen — устанавливаем xe-guest-utilities..."
+            INSTALLED=0
+            # Пробуем сначала xe-guest-utilities-latest (более новая версия)
+            if dnf install -y xe-guest-utilities-latest 2>/dev/null; then
+                INSTALLED=1
+            # Запасной вариант: стандартный пакет из EPEL
+            elif dnf install -y xe-guest-utilities 2>/dev/null; then
+                INSTALLED=1
+            fi
+            if [[ $INSTALLED -eq 1 ]]; then
+                systemctl enable --now xe-linux-distribution.service 2>/dev/null || true
+                ok "xe-guest-utilities установлены, xe-linux-distribution.service запущен"
+            else
+                warn "xe-guest-utilities не найден в репозиториях — пропускаем"
+                warn "Установить вручную: dnf install -y xe-guest-utilities"
+            fi
+            ;;
+        kvm)
+            # KVM / QEMU / libvirt (в т.ч. OpenStack, Proxmox KVM)
+            ok "KVM/QEMU — устанавливаем qemu-guest-agent..."
+            dnf install -y qemu-guest-agent
+            systemctl enable --now qemu-guest-agent
+            ok "qemu-guest-agent установлен и запущен"
+            ;;
+        vmware)
+            ok "VMware — устанавливаем open-vm-tools..."
+            dnf install -y open-vm-tools
+            systemctl enable --now vmtoolsd
+            ok "open-vm-tools установлены"
+            ;;
+        microsoft)
+            ok "Hyper-V — устанавливаем hyperv-tools..."
+            dnf install -y hyperv-tools hyperv-daemons 2>/dev/null || true
+            ok "Hyper-V tools установлены"
+            ;;
+        none|"")
+            warn "Виртуализация не обнаружена (bare metal или не определена)"
+            warn "Guest tools не требуются"
+            ;;
+        *)
+            warn "Неизвестная платформа: ${VIRT} — guest tools не устанавливаем"
+            ;;
+    esac
 
     # --- Полное обновление системы -------------------------------------------
     step "1.4 — Обновление системы (dnf update + upgrade)"
