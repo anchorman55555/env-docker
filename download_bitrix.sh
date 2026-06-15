@@ -78,18 +78,28 @@ echo -e "${G}+------------------------------------------------------------------
 echo -e "${G}|  1C-Bitrix: Internet-shop + CRM -- files ready!                  |${NC}"
 echo -e "${G}+------------------------------------------------------------------+${NC}"
 echo
-echo "STEP 1 -- Open the installer in browser:"
-echo "  Self-installer: https://${DOMAIN}/bitrixsetup.php"
-echo "  Wizard direct : https://${DOMAIN}/bitrix/wizard/"
+echo "================================================================"
+echo "  NEXT STEPS (run in this order!)"
+echo "================================================================"
 echo
-echo "STEP 2 -- Wizard DB settings:"
-echo "  Host     : mysql"
-echo "  Database : bitrix"
-echo "  User     : bitrix"
-echo "  Password : (see ${PROJECT_DIR}/.deploy_credentials)"
-echo "  Charset  : utf8mb4"
+echo "STEP 1 -- Apply DB + Redis + OpenSearch config (creates MySQL DB, writes .settings.php):"
+echo "  bash ${PROJECT_DIR}/deploy/09_bitrix_config.sh"
 echo
-echo "STEP 3 -- After wizard, apply Redis + OpenSearch config:"
+echo "  DB credentials for the wizard:"
+echo "    Host     : mysql"
+echo "    Database : bitrix"
+echo "    User     : bitrix"
+echo "    Password : (see ${PROJECT_DIR}/.deploy_credentials)"
+echo "    Charset  : utf8mb4"
+echo
+echo "STEP 2 -- Open Bitrix install wizard in browser:"
+echo "  https://${DOMAIN}/bitrixsetup.php"
+echo "  or directly: https://${DOMAIN}/bitrix/wizard/"
+echo
+echo "  NOTE: Wizard will ask for DB credentials -- use the values from STEP 1 above."
+echo "        After the wizard completes it may overwrite .settings.php, so run STEP 3."
+echo
+echo "STEP 3 -- Re-apply Redis + OpenSearch config (restores settings overwritten by wizard):"
 echo "  bash ${PROJECT_DIR}/deploy/09_bitrix_config.sh"
 echo
 echo "STEP 4 -- Print all credentials:"
