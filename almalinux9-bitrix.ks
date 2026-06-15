@@ -161,13 +161,59 @@ sysstat
 %end
 
 # ==============================================================================
-# Pre-install script — nothing needed, partitioning is fully declarative
+# Post (1/2): вне chroot — копируем проект из ISO в установленную систему
+# Запускается до chroot-секции; имеет доступ к /mnt/sysimage и к media.
 # ==============================================================================
+%post --nochroot --log=/mnt/sysimage/root/ks-post-nochroot.log
+
+SYSIMAGE="/mnt/sysimage"
+TARBALL_NAME="bitrix-deploy.tar.gz"
+TARBALL_DST="/tmp/${TARBALL_NAME}"
+
+echo "=== Поиск tarball проекта ==="
+
+# Anaconda монтирует ISO-источник в /run/install/repo
+if [ -f "/run/install/repo/deploy/${TARBALL_NAME}" ]; then
+    cp "/run/install/repo/deploy/${TARBALL_NAME}" "${TARBALL_DST}"
+    echo "Найден в /run/install/repo/deploy/"
+else
+    # Запасной вариант: монтируем CD/DVD явно
+    FOUND=0
+    for DEV in /dev/sr0 /dev/sr1 /dev/cdrom /dev/dvd /dev/hdc; do
+        [ -b "$DEV" ] || continue
+        mkdir -p /tmp/_cdmnt
+        mount -o ro "$DEV" /tmp/_cdmnt 2>/dev/null || continue
+        if [ -f "/tmp/_cdmnt/deploy/${TARBALL_NAME}" ]; then
+            cp "/tmp/_cdmnt/deploy/${TARBALL_NAME}" "${TARBALL_DST}"
+            echo "Найден на устройстве: $DEV"
+            FOUND=1
+        fi
+        umount /tmp/_cdmnt
+        [ $FOUND -eq 1 ] && break
+    done
+    [ $FOUND -eq 0 ] && echo "ВНИМАНИЕ: ${TARBALL_NAME} не найден на media!" && exit 0
+fi
+
+echo "=== Извлечение проекта в ${SYSIMAGE}/opt/bitrix ==="
+mkdir -p "${SYSIMAGE}/opt/bitrix"
+tar xzf "${TARBALL_DST}" -C "${SYSIMAGE}/opt/bitrix"
+rm -f "${TARBALL_DST}"
+
+# Права на скрипты
+chmod +x "${SYSIMAGE}/opt/bitrix/"*.sh                    2>/dev/null || true
+chmod +x "${SYSIMAGE}/opt/bitrix/deploy/"*.sh             2>/dev/null || true
+chmod 600 "${SYSIMAGE}/opt/bitrix/".env_* 2>/dev/null || true
+chmod 600 "${SYSIMAGE}/opt/bitrix/docker-compose.yml" 2>/dev/null || true
+
+echo "=== Проект успешно распакован ==="
+ls -la "${SYSIMAGE}/opt/bitrix/"
+
+%end
 
 # ==============================================================================
-# Post-install script
+# Post (2/2): в chroot — системные настройки
 # ==============================================================================
-%post --log=/root/ks-post.log
+%post --log=/root/ks-post-chroot.log
 
 # --- sysctl: OpenSearch requires vm.max_map_count >= 262144 ------------------
 cat > /etc/sysctl.d/99-opensearch.conf << 'EOF'
@@ -176,14 +222,8 @@ EOF
 sysctl -p /etc/sysctl.d/99-opensearch.conf 2>/dev/null || true
 
 # --- Fix mount point dirs needed for nested LVM mounts -----------------------
-# /var/lib/mysql/tmp is mounted OVER /var/lib/mysql, so the dir must exist
-# on the mysql LV itself. We touch it so systemd mounts work correctly.
-# (Anaconda should handle this, but we make sure)
 mkdir -p /var/lib/mysql/tmp
 chmod 1777 /var/lib/mysql/tmp
-
-# /var/lib/docker is mounted over /var (which is also a separate LV)
-# /var/log is mounted over /var — same
 mkdir -p /var/lib/docker
 mkdir -p /var/log
 
@@ -201,6 +241,7 @@ restorecon -R /var/spool/postfix 2>/dev/null || true
 restorecon -R /var/lib/mysql 2>/dev/null || true
 restorecon -R /var/lib/redis 2>/dev/null || true
 restorecon -R /var/lib/opensearch 2>/dev/null || true
+restorecon -R /opt/bitrix 2>/dev/null || true
 
 # --- SELinux booleans needed by the stack ------------------------------------
 setsebool -P ftpd_full_access on 2>/dev/null || true
@@ -208,35 +249,27 @@ setsebool -P ftpd_full_access on 2>/dev/null || true
 # --- vsftpd: register passive ports ------------------------------------------
 semanage port -a -t ftp_port_t -p tcp 21000-21010 2>/dev/null || true
 
-# --- Docker CE repo (so deploy.sh can install without extra steps) -----------
+# --- Docker CE repo (чтобы 00_init.sh не качал его заново) ------------------
 dnf install -y dnf-plugins-core 2>/dev/null || true
 dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo 2>/dev/null || true
 
-# --- Clone Bitrix project repo (adjust URL before use) ----------------------
-# git clone https://github.com/YOUR_ORG/bitrix-docker.git /opt/bitrix
-# Uncomment above line and set correct repo URL
-
-# --- Prepare /opt/bitrix dir -------------------------------------------------
-mkdir -p /opt/bitrix
-
-# --- Print disk layout summary after install ---------------------------------
+# --- /etc/motd с инструкцией -------------------------------------------------
 cat >> /etc/motd << 'MOTD'
 
 ============================================================
-  Bitrix24 Stack Server
+  Bitrix24 Stack Server — установка завершена
 ============================================================
-  Disk layout:
+  Диски:
     xvda (HDD)   vg-system   /  /var  /var/log  /var/lib/docker  /var/backup
-    xvdb (SSD)   vg-project  /mnt/bitrix/{www,cache,upload,session,logs}  /var/spool/postfix
+    xvdb (SSD)   vg-project  /mnt/bitrix/{www,cache,upload,session,logs}
     xvdc (NVMe)  vg-data     /var/lib/{mysql,mysql/tmp,opensearch,redis}
 
-  Next steps:
-    cd /opt/bitrix
-    git clone <repo_url> .
-    for f in *.example; do cp "$f" "${f%.example}"; done
-    nano .env_sql .env_push docker-compose.yml
-    bash deploy.sh
-    bash download_bitrix.sh
+  Проект: /opt/bitrix (все конфиги и скрипты уже на месте)
+
+  Следующие шаги:
+    bash /opt/bitrix/00_init.sh    # обновление ОС, пакеты, SSH-ключи
+    bash /opt/bitrix/deploy.sh     # запуск стека Bitrix24
+    bash /opt/bitrix/download_bitrix.sh  # скачать дистрибутив Bitrix
 ============================================================
 MOTD
 
